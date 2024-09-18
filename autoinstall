@@ -1,0 +1,540 @@
+#!/bin/bash
+
+function checkJsonValid {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Wrong number of arguments - expected 1, found $#" >&2
+        return 1
+    fi
+    jq . >/dev/null 2>&1 <<< "$1"
+}
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Script must be run as uid 0, using sudo"
+    exit 1
+fi
+if [[ -z "$SUDO_USER" ]]; then
+    echo "The script must be run with sudo, or another method that provides sudo and sets '"'$SUDO_USER'"'"
+    exit 1
+fi
+
+# If something goes wrong, exit - we dont wan't to randomly trash a system
+set -Eeuo pipefail
+
+echo "Grab pre-dependencies"
+apt-get -qq install -y jq
+
+if [[ -f "./autoinstall.json" ]]; then
+    userConfig="$(<./autoinstall.json)"
+    if checkJsonValid "$userConfig"; then
+        echo "Found valid JSON in autoinstall.json, loading config from file"
+    else
+        echo "Unable to find valid JSON in autoinstall.json, bailing out"
+        exit 1
+    fi
+else
+    sudo -u $SUDO_USER tee autoinstall.json >/dev/null <<EOF
+{
+    "repos": {
+        "drupal": {
+            "useExisting": false,
+            "name": "LRVSP_Drupal",
+            "owner": "MouseCat212",
+            "branch": "dev"
+        },
+        "angular": {
+            "useExisting": false,
+            "name": "LRVSP_Angular",
+            "owner": "2001herne",
+            "branch": "main"
+        },
+        "python": {
+            "useExisting": false,
+            "name": "LRVSP_Python",
+            "owner": "MouseCat212",
+            "branch": "main"
+        },
+        "config": {
+            "useExisting": false,
+            "name": "LRVSP_CONFIG",
+            "owner": "MouseCat212",
+            "branch": "main"
+        }
+    },
+    "drupal": {
+        "serverName": "api.documap.local",
+        "adminName": "student",
+        "adminPass": "student",
+        "endpoints": [{
+            "endpoint": "lrvsp_details",
+            "methods": ["GET"],
+            "roles": ["anonymous"]
+        },{
+            "endpoint": "lrvsp_docs",
+            "methods": ["GET"],
+            "roles": ["anonymous"]
+        },{
+            "endpoint": "lrvsp_links",
+            "methods": ["GET"],
+            "roles": ["anonymous"]
+        },{
+            "endpoint": "lrvsp_status",
+            "methods": ["GET"],
+            "roles": ["anonymous"]
+        },{
+            "endpoint": "lrvsp_create",
+            "methods": ["POST"],
+            "roles": ["administrator"]
+        }]
+    },
+    "angular": {
+        "serverName": "www.documap.local"
+    }
+}
+EOF
+    echo "Unable to find autoinstall.json file, generating from defaults."
+    echo "Please edit as needed, then re-run the script."
+    echo "In particular, pay attention to: "
+    echo " - Rest endpoints and permissions"
+    echo "A number of settings are currently unable to be configured via autoinstall.json."
+    echo "These include: "
+    echo " - MySQL usernames and passwords."
+    exit 1
+fi
+
+if [[ -f "./autoinstall_stages.json" ]]; then
+    installStages="$(<./autoinstall_stages.json)"
+    if checkJsonValid "$installStages"; then
+        echo "Found valid JSON in autoinstall_stages.json, loading stages"
+    else
+        echo "Unable to find valid JSON in autoinstall_stages.json, bailing out"
+        exit 1
+    fi
+else
+    sudo -u $SUDO_USER tee autoinstall_stages.json >/dev/null <<EOF
+[
+{
+        "name": "deps",
+        "status": "PEND"
+    },{
+        "name": "mysql_config_security",
+        "status": "PEND"
+    },{
+        "name": "git_repo_get_drupal",
+        "status": "PEND"
+    },{
+        "name": "git_repo_get_python",
+        "status": "PEND"
+    },{
+        "name": "git_repo_get_config",
+        "status": "PEND"
+    },{
+        "name": "git_repo_get_angular",
+        "status": "PEND"
+    },{
+        "name": "mysql_configure_python",
+        "status": "PEND"
+    },{
+        "name": "drupal_composer_install",
+        "status": "PEND"
+    },{
+        "name": "apache_configure",
+        "status": "PEND"
+    },{
+        "name": "drupal_configure",
+        "status": "PEND"
+    },{
+        "name": "drupal_drush_install",
+        "status": "PEND"
+    },{
+        "name": "drupal_drush_endpoints",
+        "status": "PEND"
+    },{
+        "name": "drupal_drush_enable_lrvsp",
+        "status": "PEND"
+    },{
+        "name": "drupal_drush_permissions",
+        "status": "PEND"
+    },{
+        "name": "python_daemon_install_deps",
+        "status": "PEND"
+    },{
+        "name": "python_daemon_install",
+        "status": "PEND"
+    },{
+        "name": "angular_install_deps",
+        "status": "PEND"
+    },{
+        "name": "angular_configure",
+        "status": "PEND"
+    }
+]
+EOF
+    echo "Unable to find autoinstall_stages.json file."
+    echo "Generating from defaults, assuming no install taken place"
+    exit
+fi
+
+function exitCleanup {
+    pushd -0
+    dirs -c
+    stageCount="$(jq length <<<"$installStages")"
+    for (( i=0; i<stageCount; i++ )); do
+        stage="$(jq -r '.['"$i"'].name' <<<"$installStages")"
+        case "$(jq -r '.['"$i"'].status' <<<"$installStages")" in
+            "FAIL")
+                echo "Install failed during $stage"
+                echo "Attemping automated cleanup. Some manual cleanup may still be needed, depending on exact errors."
+                case "$stage" in
+                    "drupal_configure" | "drupal_drush_install" | "drupal_drush_enable_lrvsp" | "drupal_drush_permissions" | "python_daemon_install_deps" | "python_daemon_install" | "angular_install_deps" | "angular_configure")
+                        cleanupFunc="do_cleanup_$stage"
+                        ;;
+                    git_repo_get_*)
+                        cleanupFunc="do_cleanup_git_repo_get $(echo "$stage" | rev | cut -d '_' -f 1 | rev )"
+                        ;;
+                    *)
+                        cleanupFunc="echo No cleanup needed for $stage"
+                        ;;
+                esac
+                $cleanupFunc
+                installStages="$(jq '.['"$i"'].status="PEND"' <<<"$installStages")"
+            ;;
+        esac
+    done
+    echo "$installStages" > autoinstall_stages.json
+    exit 1
+}
+
+trap exitCleanup EXIT
+
+function do_deps {
+    pkgs=(
+mysql-server
+apache2
+    libapache2-mpm-itk
+    libapache2-mod-php
+    php-xml
+    php-gd
+    php-mysql
+composer
+python3-venv
+npm)
+    apt update
+    apt upgrade
+    xargs apt install -y <<<"${pkgs[@]}"
+}
+
+function do_mysql_config_security {
+    systemctl enable --now mysql.service
+    echo  "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'password';" | mysql
+    mysql_secure_installation --password=password <<EOF
+N
+N
+Y
+Y
+Y
+Y
+EOF
+    echo  "ALTER USER 'root'@'localhost' IDENTIFIED WITH auth_socket;" | mysql -u root -ppassword
+}
+
+function do_git_repo_get {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Wrong number of arguments - expected 1, found $#" >&2
+        return 1
+    fi
+    repo="$(jq '.repos.'"$1" <<<"$userConfig")"
+    repoName="$(jq -r '.name' <<<"$repo")"
+    repoOwner="$(jq -r '.owner' <<<"$repo")"
+    repoBranch="$(jq -r '.branch' <<<"$repo")"
+    if ! [[ -d "$repoName" ]]; then
+        sudo -u $SUDO_USER git clone 'https://github.com/'"$repoOwner"'/'"$repoName"'.git'
+        pushd "$repoName"
+        git checkout "$repoBranch"
+        popd
+    else
+        echo "Repo $repoName already exists, using already existing repo."
+        echo "To re-sync, delete or move the existing repo."
+    fi
+}
+
+function do_cleanup_git_repo_get {
+    if [[ "$#" -ne 1 ]]; then
+        echo "Wrong number of arguments - expected 1, found $#" >&2
+        return 1
+    fi
+    repo="$(jq '.repos.'"$1" <<<"$userConfig")"
+    repoName="$(jq -r '.name' <<<"$repo")"
+    existingBackups="$(find . -maxdepth 1 -type d -name "$repoName"'.bak*' -printf '.' | wc -m)"
+    if [[ -d "$repoName" ]]; then
+        echo "Found $repoName. moving to ${repoName}.bak.$existingBackups to prevent accitental deletion of work."
+        mv "$repoName" "${repoName}.bak.$existingBackups"
+    fi
+}
+
+function do_mysql_configure_python {
+    repoName="$(jq -r '.repos.config.name' <<<"$userConfig")"
+    pushd "$repoName"
+    echo "source SETUP.sql" | mysql
+    popd
+}
+
+function do_drupal_composer_install {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    sudo -u $SUDO_USER composer install
+    popd
+}
+
+function do_apache_configure {
+    systemctl enable --now apache2
+    a2enmod rewrite headers
+    systemctl restart apache2
+    adduser www-data $SUDO_USER
+}
+
+function do_drupal_configure {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    sudo -u $SUDO_USER mkdir -p web/modules/custom
+    pushd web/modules/custom
+    ls
+    sudo -u $SUDO_USER ln -s "$(dirs -l +1)/custom/lrvsp" lrvsp
+    popd
+    pushd web/sites/default
+    chown -R www-data: files
+    chmod 777 files
+    popd
+    documentRoot="$(pwd)/web"
+    serverName="$(jq -r '.drupal.serverName' <<<"$userConfig")"
+    cat > /etc/apache2/sites-available/"$serverName".conf <<EOF
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    ServerName $serverName
+
+    DocumentRoot "$documentRoot"
+
+    <Directory "$documentRoot" >
+        Require all granted
+        Header set Access-Control-Allow-Headers 'Authorization, Content-Type, Cache-Control, Expires, Pragma'
+        Header set Access-Control-Allow-Origin '*'
+        AllowOverride All
+    </Directory>
+</VirtualHost>
+EOF
+    a2ensite "${serverName}.conf"
+    systemctl reload apache2
+    popd
+}
+
+function do_cleanup_drupal_configure {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    rm -r web/modules/custom
+    serverName="$(jq -r '.drupal.serverName' <<<"$userConfig")"
+    a2dissite "${serverName}.conf"
+    rm /etc/apache2/sites-available/"$serverName".conf
+    systemctl reload apache2
+    popd
+}
+
+function do_drupal_drush_install {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    pushd web/sites/default
+    sudo -u $SUDO_USER cp settings.php settings.php.bak
+    popd
+    sudo -u $SUDO_USER vendor/bin/drush si -y standard --db-url=mysql://LRVSPAdmin:password@localhost:3306/Drupal --site-name="$(jq -r '.drupal.serverName' <<< "$userConfig")" --account-name="$(jq -r '.drupal.adminName' <<< "$userConfig")"
+    sudo -u $SUDO_USER vendor/bin/drush user:password  "$(jq -r '.drupal.adminName' <<< "$userConfig")" "$(jq -r '.drupal.adminPass' <<< "$userConfig")"
+    chmod 755 web/sites/default
+    chmod 755 web/sites/default/settings.php
+    popd
+    configRepoName="$(jq -r '.repos.config.name' <<<"$userConfig")"
+    cat "$configRepoName"/settings.php | sudo tee -a "$repoName"/web/sites/default/settings.php
+}
+
+function do_cleanup_drupal_drush_install {
+    pushd LRVSP_Drupal/web/sites/default
+    sudo -u $SUDO_USER mv settings.php.bak settings.php
+    popd
+}
+
+function do_drupal_drush_endpoints {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    endpointScaffold='{
+    "langcode": "en",
+    "status": true,
+    "dependencies": {
+        "module": [
+            "lrvsp",
+            "serialization",
+            "user"
+        ]
+    },
+    "id": "",
+    "plugin_id": "",
+    "granularity": "resource",
+    "configuration": {
+        "methods": [],
+        "formats": ["json"],
+        "authentication": ["cookie"]
+    }
+}'
+    endpointCount="$(jq '.drupal.endpoints|length' <<<"$userConfig")"
+    for ((j=0; j<endpointCount; j++)); do
+        endpoint="$(jq '.drupal.endpoints['"$j"']' <<< "$userConfig")"
+        endpointName="$(jq -r '.endpoint' <<< "$endpoint")"
+        endpointMethods="$(jq '.methods' <<< "$endpoint")"
+        endpointConfig="$(echo "$endpointScaffold" | jq '.id="'$endpointName'"' | jq '.plugin_id="'$endpointName'"' | jq '.configuration.methods='"$endpointMethods")"
+        vendor/bin/drush config:set -y --input-format=yaml rest.resource."$endpointName" ? "$endpointConfig"
+    done
+    popd
+}
+
+function do_drupal_drush_enable_lrvsp {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    vendor/bin/drush en -y lrvsp
+    popd
+}
+
+function do_cleanup_drupal_drush_enable_lrvsp {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    vendor/bin/drush un -y lrvsp
+    popd
+}
+
+function do_drupal_drush_permissions {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    endpointCount="$(jq '.drupal.endpoints|length' <<<"$userConfig")"
+    permissionNames=()
+    for ((j=0; j<endpointCount; j++)); do
+        endpoint="$(jq '.drupal.endpoints['"$j"']' <<< "$userConfig")"
+        endpointName="$(jq -r '.endpoint' <<< "$endpoint")"
+        for method in $(jq -r .methods[] <<< "$endpoint" | tr '[:upper:]' '[:lower:]'); do
+            for role in $(jq -r .roles[] <<< "$endpoint" | tr '[:upper:]' '[:lower:]'); do
+                vendor/bin/drush role:perm:add $role "restful $method $endpointName"
+            done
+        done
+    done
+    popd
+}
+
+function do_cleanup_drupal_drush_permissions {
+    repoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    endpointCount="$(jq '.drupal.endpoints|length' <<<"$userConfig")"
+    permissionNames=()
+    for ((j=0; j<endpointCount; j++)); do
+        endpoint="$(jq '.drupal.endpoints['"$j"']' <<< "$userConfig")"
+        endpointName="$(jq -r '.endpoint' <<< "$endpoint")"
+        for method in $(jq -r .methods[] <<< "$endpoint" | tr '[:upper:]' '[:lower:]'); do
+            for role in $(jq -r .roles[] <<< "$endpoint" | tr '[:upper:]' '[:lower:]'); do
+                vendor/bin/drush role:perm:remove $role "restful $method $endpointName"
+            done
+        done
+    done
+    popd
+}
+
+function do_python_daemon_install_deps {
+    repoName="$(jq -r '.repos.python.name' <<<"$userConfig")"
+    pushd "$repoName"
+    sudo -u $SUDO_USER bash -c 'python3 -m venv ./venv;
+    source ./venv/bin/activate;
+    pip install -r requirements.txt'
+    popd
+}
+
+function do_cleanup_python_daemon_install_deps {
+    repoName="$(jq -r '.repos.python.name' <<<"$userConfig")"
+    pushd "$repoName"
+    rm -r ./venv
+    popd
+}
+
+function do_python_daemon_install {
+    repoName="$(jq -r '.repos.python.name' <<<"$userConfig")"
+    drupalRepoName="$(jq -r '.repos.drupal.name' <<<"$userConfig")"
+    pushd "$repoName"
+    sed -e "s:/path/to/drupal/base:$(realpath $(pwd)/../$drupalRepoName):" \
+        -e "s:/path/to/log/file.log:$(realpath $(pwd)/out.log):" \
+        config.template.py | sudo -u $SUDO_USER tee config.py
+    GROUP="$(id -gn)" LRVSP_PYTHON_VENV="$(realpath ./venv)" LRVSP_PYTHON_ROOT="$(realpath .)" envsubst < lrvspDaemon.template.service | sudo tee /etc/systemd/system/lrvspDaemon.service
+    systemctl daemon-reload
+    systemctl enable --now lrvspDaemon.service
+    popd
+}
+
+function do_cleanup_python_daemon_install {
+    repoName="$(jq -r '.repos.python.name' <<<"$userConfig")"
+    pushd "$repoName"
+    systemctl stop lrvspDaemon.service
+    systemctl disable lrvspDaemon.service
+    rm config.py
+    rm /etc/systemd/system/lrvspDaemon.service
+    systemctl daemon-reload
+    popd
+}
+
+function do_angular_install_deps {
+    repoName="$(jq -r '.repos.angular.name' <<<"$userConfig")"
+    pushd "$repoName"
+    sudo -u $SUDO_USER npm install
+    npm -g install @angular/cli
+    popd
+}
+
+function do_cleanup_angular_install_deps {
+    repoName="$(jq -r '.repos.angular.name' <<<"$userConfig")"
+    pushd "$repoName"
+    rm -r node_modules
+    npm -g uninstall @angular/cli
+    popd
+}
+
+function do_angular_configure {
+    repoName="$(jq -r '.repos.angular.name' <<<"$userConfig")"
+    serverName="$(jq -r '.drupal.serverName' <<<"$userConfig")"
+    pushd "$repoName/src/environments"
+    sudo -u $SUDO_USER cp environment.development.ts environment.development.ts.bak
+    sudo -u $SUDO_USER sed -i -e 's>http://api.lrvs.local>'$serverName'>' environment.development.ts
+    popd
+}
+
+function do_cleanup_angular_configure {
+    repoName="$(jq -r '.repos.angular.name' <<<"$userConfig")"
+    pushd "$repoName/src/environments"
+    sudo -u $SUDO_USER mv environment.development.ts.bak environment.development.ts
+    popd
+}
+
+stageCount="$(jq length <<<"$installStages")"
+echo "FellThrough"
+for (( i=0; i<stageCount; i++ )); do
+    case "$(jq -r '.['"$i"'].status' <<<"$installStages")" in
+        "PEND")
+            stage="$(jq -r '.['"$i"'].name' <<<"$installStages")"
+            case "$stage" in
+                "deps" | "mysql_config_security" | "mysql_configure_python" | "drupal_composer_install" | "apache_configure" | "drupal_configure" | "drupal_drush_install" | "drupal_drush_endpoints" | "drupal_drush_enable_lrvsp" | "drupal_drush_permissions" | "python_daemon_install_deps" | "python_daemon_install" | "angular_install_deps" | "angular_configure")
+                    stageFunc="do_$stage"
+                    ;;
+                git_repo_get_*)
+                    stageFunc="do_git_repo_get $(echo "$stage" | rev | cut -d '_' -f 1 | rev)"
+                    ;;
+                *)
+                    stageFunc="echo Executing $stage"
+            esac
+            installStages="$(jq '.['"$i"'].status="FAIL"' <<<"$installStages")"
+            $stageFunc
+            installStages="$(jq '.['"$i"'].status="COMPLETE"' <<<"$installStages")"
+            ;;
+        "COMPLETE")
+            echo "$(jq -r '.['"$i"'].name' <<<"$installStages") was sucessful last run. Skipping..."
+            ;;
+    esac
+done
+
+exit 0
