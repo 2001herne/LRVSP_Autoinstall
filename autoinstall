@@ -500,7 +500,7 @@ function do_angular_configure {
     serverName="$(jq -r '.drupal.serverName' <<<"$userConfig")"
     pushd "$repoName/src/environments"
     sudo -u $SUDO_USER cp environment.development.ts environment.development.ts.bak
-    sudo -u $SUDO_USER sed -i -e 's>http://api.lrvs.local>'$serverName'>' environment.development.ts
+    sudo -u $SUDO_USER sed -i -e 's>http://api.lrvs.local>'"http://$serverName"'>' environment.development.ts
     popd
 }
 
